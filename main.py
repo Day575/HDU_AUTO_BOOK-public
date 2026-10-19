@@ -32,6 +32,7 @@ OPEN_DELAY_SECONDS = 0.5  # 开放后再等这么久发第一个请求
 WAIT_FOR_OPEN_MINUTES = 10  # 在开放前这么多分钟内启动才等到开放，否则立即预约
 OPEN_RETRY_MINUTES = 3  # 开放后这么多分钟内遇到「超出可预约」每秒重试（应对时钟差）
 LOGIN_ATTEMPTS = 3  # 登录失败时的总尝试次数
+NOTICE_ATTEMPTS = 3  # Server酱推送失败时的总尝试次数
 
 
 def target_weekday_name():
@@ -314,15 +315,19 @@ class SeatAutoBooker:
                 'title': message,
                 'desp': desp or '',
             }
-            try:
-                r = requests.post(url, data=data, timeout=10)
-                if r.json()["code"] == 0:
-                    print("Server酱通知成功")
-                else:
-                    print("Server酱通知失败：{}".format(r.text))
-            except Exception as e:
-                logging.exception(e)
-                print(e.__class__, "推送服务配置错误")
+            # 偶发读超时，重试几次
+            for attempt in range(1, NOTICE_ATTEMPTS + 1):
+                try:
+                    r = requests.post(url, data=data, timeout=30)
+                    if r.json()["code"] == 0:
+                        print("Server酱通知成功")
+                        return
+                    print("Server酱通知失败（第{}次）：{}".format(attempt, r.text))
+                except Exception as e:
+                    logging.exception(e)
+                    print(e.__class__, "Server酱推送出错（第{}次）".format(attempt))
+                if attempt < NOTICE_ATTEMPTS:
+                    time.sleep(5)
 
 if __name__ == "__main__":
     logging.info('Start of the program')
