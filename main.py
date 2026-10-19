@@ -31,6 +31,7 @@ OPEN_HOUR = 20  # 每晚 20:00 开放后天的座位
 OPEN_DELAY_SECONDS = 0.5  # 开放后再等这么久发第一个请求
 WAIT_FOR_OPEN_MINUTES = 10  # 在开放前这么多分钟内启动才等到开放，否则立即预约
 OPEN_RETRY_MINUTES = 3  # 开放后这么多分钟内遇到「超出可预约」每秒重试（应对时钟差）
+LOGIN_ATTEMPTS = 3  # 登录失败时的总尝试次数
 
 
 def target_weekday_name():
@@ -263,9 +264,28 @@ class SeatAutoBooker:
 
             logging.info("登录成功！")
         except Exception as e:
-            logging.error(f"登录失败：{e}")
+            logging.error(f"登录失败：{e.__class__.__name__} {e}")
+            self.log_login_page()
             return -1
         return 0
+
+    # 登录失败时记下停在哪个页面、页面上的提示，便于排查（不含账号信息）
+    def log_login_page(self):
+        try:
+            url = urlsplit(self.driver.current_url)
+            print("登录失败时页面：{}{}".format(url.hostname, url.path))
+            tips = []
+            for el in self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "[class*='error'], [class*='Error'], [class*='tip'], [class*='message'], [class*='captcha'], [class*='verify']"
+            ):
+                if el.is_displayed():
+                    text = el.text.strip().replace("\n", " ")
+                    if text and text not in tips:
+                        tips.append(text[:80])
+            print("页面提示：{}".format(" | ".join(tips[:5]) or "无"))
+        except Exception as e:
+            logging.exception(e)
 
     def get_user_info(self):
         logging.info('Getting user info')
@@ -332,7 +352,12 @@ if __name__ == "__main__":
     book_date = (datetime.now() + timedelta(days=BOOK_DAYS_AHEAD)).strftime("%m-%d")
     day_label = "{} {}".format(book_date, target_weekday_name())
     s = SeatAutoBooker(basic_config["SeatAutoBooker"])
-    if not s.login() == 0:
+    for attempt in range(1, LOGIN_ATTEMPTS + 1):
+        if s.login() == 0:
+            break
+        print("第{}次登录失败".format(attempt))
+        s.driver.delete_all_cookies()
+    else:
         s.driver.quit()
         logging.info('Login unsuccessful')
         s.wechatNotice("{} 预约失败：登录失败".format(day_label), "统一身份认证登录失败，检查 SCHOOL_ID / PASSWORD 是否正确。")
