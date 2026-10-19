@@ -26,10 +26,32 @@ WEEKDAYS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'
 BOOK_DAYS_AHEAD = 2  # 预约后天
 ALREADY_BOOKED_KEYS = ("已有预约", "重复预约", "请先取消", "当前已有", "只能预约一个", "已存在预约")
 SEAT_TAKEN_KEYS = ("已被", "占用", "不可用", "不存在", "冲突")
+NOT_OPEN_KEYS = ("超出可预约",)
+OPEN_HOUR = 20  # 每晚 20:00 开放后天的座位
+OPEN_DELAY_SECONDS = 0.5  # 开放后再等这么久发第一个请求
+WAIT_FOR_OPEN_MINUTES = 10  # 在开放前这么多分钟内启动才等到开放，否则立即预约
+OPEN_RETRY_MINUTES = 3  # 开放后这么多分钟内遇到「超出可预约」每秒重试（应对时钟差）
 
 
 def target_weekday_name():
     return WEEKDAYS[(datetime.now().weekday() + BOOK_DAYS_AHEAD) % 7]
+
+
+def open_time():
+    return datetime.now().replace(hour=OPEN_HOUR, minute=0, second=0, microsecond=0)
+
+
+def in_open_window():
+    now = datetime.now()
+    return open_time() <= now < open_time() + timedelta(minutes=OPEN_RETRY_MINUTES)
+
+
+def wait_until_open():
+    target = open_time() + timedelta(seconds=OPEN_DELAY_SECONDS)
+    seconds = (target - datetime.now()).total_seconds()
+    if 0 < seconds <= WAIT_FOR_OPEN_MINUTES * 60:
+        print("等到 {} 开放后再预约（{:.1f}秒）".format(target.strftime("%H:%M:%S.%f")[:-5], seconds))
+        time.sleep(seconds)
 
 
 def is_booking_enable(date_cfg):
@@ -128,27 +150,42 @@ class SeatAutoBooker:
 
     def _book_slot(self, user_config, seat_config, start, hours, preferred_seat=None):
         retry_sleep_time = timedelta(minutes=self.cfg["cron-delta-minutes"]).seconds*2/(self.cfg["max-retry"]-2) - 10
-        for tried_times in range(self.cfg["max-retry"]):
+        taken_seats = set()
+        result = None
+        tried_times = 0
+        while tried_times < self.cfg["max-retry"]:
             try:
-                result = self._book_favorite_seat(user_config, seat_config, start, hours, tried_times, preferred_seat)
+                result = self._book_favorite_seat(user_config, seat_config, start, hours, tried_times, preferred_seat, taken_seats)
+                if result is None:
+                    print("自定义座位都已被占")
+                    return None
                 msg = str(result[1]) if result else ""
+                if any(k in msg for k in NOT_OPEN_KEYS) and in_open_window():
+                    print("还未开放({})，1秒后重试".format(result[1]))
+                    time.sleep(1)
+                    continue
+                tried_times += 1
                 if result and any(k in msg for k in ALREADY_BOOKED_KEYS):
                     print("该时段已有预约，跳过：{}".format(result[1]))
                     return result
                 if result and any(k in msg for k in ("频繁", "人数过多")):
-                    print("触发限流({})，{:.0f}秒后重试".format(result[1], retry_sleep_time))
-                    time.sleep(retry_sleep_time)
+                    sleep_time = 1 if in_open_window() else retry_sleep_time
+                    print("触发限流({})，{:.0f}秒后重试".format(result[1], sleep_time))
+                    time.sleep(sleep_time)
                     continue
                 if result and any(k in msg for k in SEAT_TAKEN_KEYS):
                     print("座位不可约({})，换一个再试".format(result[1]))
+                    taken_seats.add(result[2])
                     continue
                 return result
             except Exception as e:
+                tried_times += 1
                 logging.exception(e)
                 print(e.__class__, "尝试第{}次".format(tried_times))
-                time.sleep(retry_sleep_time)
+                time.sleep(1 if in_open_window() else retry_sleep_time)
+        return result
 
-    def _book_favorite_seat(self, user_config, seat_config, start, hours, tried_times=0, preferred_seat=None):
+    def _book_favorite_seat(self, user_config, seat_config, start, hours, tried_times=0, preferred_seat=None, taken_seats=()):
         logging.info('Entering _book_favorite_seat method')
         date_config = user_config[target_weekday_name()]
         seats = get_seats_with_config(user_config, date_config, seat_config)
@@ -157,18 +194,22 @@ class SeatAutoBooker:
         delta = book_time - self.cfg["start-time"]
         total_seconds = delta.days * 24 * 3600 + delta.seconds
         # 第一轮优先沿用上一时段约到的座位，被占后再随机换
-        if tried_times == 0 and preferred_seat in seats:
+        free_seats = [s for s in seats if s not in taken_seats]
+        if date_config['name'] == '自定义' and not free_seats:
+            return None
+        if tried_times == 0 and preferred_seat in free_seats:
             seat = preferred_seat
-        elif date_config['name'] == '自定义' and tried_times<self.cfg["max-retry"]/3*2:
-            seat = seats[0]
+        elif date_config['name'] == '自定义':
+            # 按列表顺序，被占的跳过
+            seat = free_seats[0]
         else:
-            seat = random.choice(seats)
+            seat = random.choice(free_seats or seats)
         data = f"beginTime={total_seconds}&duration={3600 * hours}&&seats[0]={seat}&seatBookers[0]={self.user_data['uid']}"
 
         headers = self.cfg["headers"]
         headers['Cookie'] = self.cookie
         print(data)
-        self.resp = requests.post(self.cfg["target"], data=data, headers=headers)
+        self.resp = requests.post(self.cfg["target"], data=data, headers=headers, timeout=10)
         self.json = json.loads(self.resp.text)
         return self.json["CODE"], self.json["MESSAGE"] + " 座位:{}".format(seat), seat
 
@@ -247,18 +288,18 @@ class SeatAutoBooker:
     def wechatNotice(self, message, desp=None):
         logging.info('Sending WeChat notice')
 
-        if self.SCKey != '':
-            url = 'https://sctapi.ftqq.com/{0}.send'.format(self.SCKey)
+        if self.SCKey:
+            url = 'https://sctapi.ftqq.com/{0}.send'.format(self.SCKey.strip())
             data = {
                 'title': message,
-                desp: desp,
+                'desp': desp or '',
             }
             try:
-                r = requests.post(url, data=data)
-                if r.json()["data"]["error"] == 'SUCCESS':
+                r = requests.post(url, data=data, timeout=10)
+                if r.json()["code"] == 0:
                     print("Server酱通知成功")
                 else:
-                    print("Server酱通知失败")
+                    print("Server酱通知失败：{}".format(r.text))
             except Exception as e:
                 logging.exception(e)
                 print(e.__class__, "推送服务配置错误")
@@ -272,6 +313,11 @@ if __name__ == "__main__":
     with open("config/seat_config.yml", 'r') as f_obj:
         seat_config = yaml.safe_load(f_obj)
 
+    # GitHub 定时常晚几小时，过了零点才跑时后天的座位还没开放，跳过
+    if os.environ.get("GITHUB_EVENT_NAME") == "schedule" and datetime.now().hour < OPEN_HOUR:
+        print("定时任务延迟到 {} 才运行，跳过".format(datetime.now().strftime("%H:%M")))
+        exit(0)
+
     if not is_booking_enable(user_config[target_weekday_name()]):
         logging.info('预约未启用')
         print("预约未启用")
@@ -283,17 +329,34 @@ if __name__ == "__main__":
         print("user_config.yml 中「{}」的时段配置有误：{}".format(target_weekday_name(), e))
         exit(-1)
 
+    book_date = (datetime.now() + timedelta(days=BOOK_DAYS_AHEAD)).strftime("%m-%d")
+    day_label = "{} {}".format(book_date, target_weekday_name())
     s = SeatAutoBooker(basic_config["SeatAutoBooker"])
     if not s.login() == 0:
         s.driver.quit()
         logging.info('Login unsuccessful')
+        s.wechatNotice("{} 预约失败：登录失败".format(day_label), "统一身份认证登录失败，检查 SCHOOL_ID / PASSWORD 是否正确。")
         exit(-1)
     if not s.get_user_info() == 0:
         s.driver.quit()
         logging.info('Getting user info unsuccessful')
+        s.wechatNotice("{} 预约失败：获取用户信息失败".format(day_label), "登录后获取用户信息失败，详见 Actions 日志。")
         exit(-1)
+    wait_until_open()
     results = s.book_favorite_seat(user_config=user_config, seat_config=seat_config)
+    lines = []
+    all_ok = bool(results)
+    all_booked_before = bool(results)
     for slot, code, message in results:
         print("预约结果[{}]: {} {}".format(slot, code, message))
+        lines.append("- {}：{} {}".format(slot, code, message))
+        booked_before = any(k in str(message) for k in ALREADY_BOOKED_KEYS)
+        if not booked_before:
+            all_booked_before = False
+        if "成功" not in str(message) and not booked_before:
+            all_ok = False
     s.driver.quit()
+    # 补跑时各时段都已约过，前一次已推送过，不重复推
+    if not all_booked_before:
+        s.wechatNotice("{} 预约{}".format(day_label, "成功" if all_ok else "未全部成功"), "\n".join(lines))
     logging.info('End of the program')
