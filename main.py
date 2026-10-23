@@ -11,6 +11,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
+from selenium.common.exceptions import TimeoutException
 from urllib.parse import urlsplit
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.wait import WebDriverWait
@@ -31,7 +32,7 @@ OPEN_HOUR = 20  # 每晚 20:00 开放后天的座位
 OPEN_DELAY_SECONDS = 0.5  # 开放后再等这么久发第一个请求
 WAIT_FOR_OPEN_MINUTES = 10  # 在开放前这么多分钟内启动才等到开放，否则立即预约
 OPEN_RETRY_MINUTES = 3  # 开放后这么多分钟内遇到「超出可预约」每秒重试（应对时钟差）
-LOGIN_ATTEMPTS = 3  # 登录失败时的总尝试次数
+LOGIN_ATTEMPTS = 4  # 登录失败时的总尝试次数
 NOTICE_ATTEMPTS = 3  # Server酱推送失败时的总尝试次数
 
 
@@ -248,11 +249,28 @@ class SeatAutoBooker:
             pwd_el.send_keys(self.pd)
             logging.info('输入密码')
 
-            # 失焦后再点登录
+            # 失焦后再点登录；按钮 15 秒内没变可点，就补发输入事件，再不行直接回车 / 点击提交
             pwd_el.send_keys(Keys.TAB)
-            form_wait.until(lambda d: "disabled" not in d.find_element(
-                By.CSS_SELECTOR, "button.login-button").get_attribute("class"))
-            self.driver.find_element(By.CSS_SELECTOR, "button.login-button").click()
+            login_button = self.driver.find_element(By.CSS_SELECTOR, "button.login-button")
+            try:
+                WebDriverWait(self.driver, 15, 0.5).until(
+                    lambda d: "disabled" not in login_button.get_attribute("class"))
+            except TimeoutException:
+                logging.warning("登录按钮 15 秒仍不可点，补发输入事件")
+                self.log_login_page()
+                for el, value in ((user_el, self.un), (pwd_el, self.pd)):
+                    self.driver.execute_script(
+                        "var el=arguments[0];"
+                        "Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(el,arguments[1]);"
+                        "['input','change','blur'].forEach(function(t){el.dispatchEvent(new Event(t,{bubbles:true}));});",
+                        el, value)
+                try:
+                    WebDriverWait(self.driver, 5, 0.5).until(
+                        lambda d: "disabled" not in login_button.get_attribute("class"))
+                except TimeoutException:
+                    logging.warning("按钮仍不可点，直接回车提交")
+                    pwd_el.send_keys(Keys.ENTER)
+            self.driver.execute_script("arguments[0].click();", login_button)
             logging.info('点击登录按钮')
 
             # 等跳回图书馆域名
@@ -285,6 +303,15 @@ class SeatAutoBooker:
                     if text and text not in tips:
                         tips.append(text[:80])
             print("页面提示：{}".format(" | ".join(tips[:5]) or "无"))
+            button = self.driver.find_elements(By.CSS_SELECTOR, "button.login-button")
+            if button:
+                print("登录按钮：class={} title={}".format(button[0].get_attribute("class"), button[0].get_attribute("title")))
+            # 验证码相关元素（极验 / reCAPTCHA / 图形验证码）是否在页面上、是否可见
+            for sel in ("[class*='geetest']", "#google_recaptcha", "iframe", "img[src*='aptcha']", "input[name='captcha_code']"):
+                els = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                print("元素 {}：共 {} 个，可见 {} 个".format(sel, len(els), sum(1 for e in els if e.is_displayed())))
+            body = self.driver.find_element(By.TAG_NAME, "body").text.strip().replace("\n", " ")
+            print("页面文字：{}".format(body[:200]))
         except Exception as e:
             logging.exception(e)
 
@@ -365,7 +392,7 @@ if __name__ == "__main__":
     else:
         s.driver.quit()
         logging.info('Login unsuccessful')
-        s.wechatNotice("{} 预约失败：登录失败".format(day_label), "统一身份认证登录失败，检查 SCHOOL_ID / PASSWORD 是否正确。")
+        s.wechatNotice("{} 预约失败：登录失败".format(day_label), "统一身份认证登录失败，详见 Actions 日志（也可能是学校登录页临时异常）。")
         exit(-1)
     if not s.get_user_info() == 0:
         s.driver.quit()
